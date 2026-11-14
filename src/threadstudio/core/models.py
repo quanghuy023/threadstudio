@@ -144,6 +144,7 @@ class SegmentItem:
     seg_id: str
     is_root_post: bool
     username: str
+    time_ago: str = ""  # Relative label shown on Threads (e.g. 23h, 12m) — fixed at scrape time
     avatar_url: str = ""
     avatar_local: str = ""
     raw_text: str = ""

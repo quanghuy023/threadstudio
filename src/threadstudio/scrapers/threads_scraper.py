@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import time as _time
 from typing import Any
 import urllib.request
 
@@ -14,6 +15,62 @@ _SPAM_PATTERNS = re.compile(
     r"(shopee\.vn|shope\.ee|s\.shopee|lazada\.vn|tiktok\.com/@|bio\s+link|link\s+mua|giỏ\s+hàng|aff|pass\s+đồ)",
     re.IGNORECASE,
 )
+
+# Threads UI chrome that leaks into DOM text spans (translation affordance, etc.)
+_THREADS_UI_LINE = re.compile(
+    r"^(translate|see translation|view translation|dịch|xem bản dịch|bản dịch|"
+    r"author|tác giả|người đăng|original poster)$",
+    re.IGNORECASE,
+)
+_THREADS_UI_TAIL = re.compile(
+    r"[\s\n]*\b(translate|see translation|view translation|dịch|xem bản dịch|"
+    r"author|tác giả|người đăng)\b\s*$",
+    re.IGNORECASE,
+)
+_RELATIVE_TIME_LABEL = re.compile(
+    r"^(\d+[smhdw]|(\d+)\s*(giờ|phút|ngày|giây|tuần|tháng|năm)|vừa xong|hôm qua)$",
+    re.IGNORECASE,
+)
+
+
+def _is_relative_time_label(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _RELATIVE_TIME_LABEL.match(t):
+        return True
+    return bool(re.match(r"^\d{1,3}[hH]$", t))
+
+
+def _time_ago_from_taken(taken_at: int) -> str:
+    """Format like Threads short relative labels (23h, 45m, 3d)."""
+    try:
+        delta = max(0, int(_time.time()) - int(taken_at))
+    except (TypeError, ValueError):
+        return ""
+    if delta < 60:
+        return f"{delta}s"
+    if delta < 3600:
+        return f"{delta // 60}m"
+    if delta < 86_400:
+        return f"{delta // 3600}h"
+    if delta < 604_800:
+        return f"{delta // 86_400}d"
+    if delta < 2_592_000:
+        return f"{delta // 604_800}w"
+    return f"{max(1, delta // 2_592_000)}mo"
+
+
+def _strip_threads_ui_noise(text: str) -> str:
+    if not text:
+        return ""
+    lines: list[str] = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        s = _THREADS_UI_TAIL.sub("", line.strip()).strip()
+        if not s or _THREADS_UI_LINE.match(s) or _is_relative_time_label(s):
+            continue
+        lines.append(s)
+    return "\n".join(lines).strip()
 
 
 def is_spam_comment(text: str) -> bool:
@@ -123,15 +180,16 @@ def scrape_threads_url(
         dom_fallback = _extract_dom_fallback(page)
         ctx.close()
 
-    posts = _collect_post_objects(captured_payloads)
-    if not posts and dom_fallback:
-        posts = dom_fallback
+    posts = _collect_post_objects(captured_payloads, page_url=url.strip())
+    if dom_fallback:
+        posts = _merge_posts_with_dom(posts, dom_fallback, url.strip())
+    elif not posts:
+        posts = []
 
     if not posts:
         raise RuntimeError("Không đọc được nội dung bài viết Threads. Hãy kiểm tra link hoặc bấm Đăng nhập Threads.")
 
-    root = posts[0]
-    replies = posts[1:]
+    root, replies = _split_root_and_replies(posts, url.strip())
     filtered = _select_comments(root, replies, comment_mode=comment_mode, max_comments=max_comments)
 
     all_items = [root, *filtered]
@@ -150,10 +208,11 @@ def scrape_threads_url(
                 seg_id=seg_id,
                 is_root_post=(idx == 0),
                 username=item.get("username", "threads_user"),
+                time_ago=str(item.get("time_ago", "") or "").strip(),
                 avatar_url=item.get("avatar_url", ""),
                 avatar_local=avatar_local,
-                raw_text=item.get("text", "").strip(),
-                spoken_text=item.get("text", "").strip(),
+                raw_text=_strip_threads_ui_noise(item.get("text", "")),
+                spoken_text=_strip_threads_ui_noise(item.get("text", "")),
                 image_urls=item.get("image_urls", []),
                 image_locals=img_locals,
                 likes=int(item.get("likes", 0)),
@@ -215,12 +274,275 @@ def sample_video1_script() -> str:
     )
 
 
-def _collect_post_objects(payloads: list[Any]) -> list[dict[str, Any]]:
+def _parse_url_target(url: str) -> tuple[str, str]:
+    """Extract @username and post shortcode/id from a Threads permalink."""
+    m = re.search(r"/@([A-Za-z0-9._]+)/post/([A-Za-z0-9_-]+)", url)
+    if m:
+        return m.group(1).lower(), m.group(2)
+    m2 = re.search(r"/post/([A-Za-z0-9_-]+)", url)
+    if m2:
+        return "", m2.group(1)
+    return "", ""
+
+
+def _norm_user(name: str) -> str:
+    return (name or "").strip().lower().lstrip("@")
+
+
+def _text_key(text: str, n: int = 56) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())[:n]
+
+
+def _find_api_match(dom_row: dict[str, Any], api_posts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    du = _norm_user(dom_row.get("username", ""))
+    dt = _text_key(dom_row.get("text", ""))
+    for p in api_posts:
+        if _norm_user(p.get("username", "")) != du:
+            continue
+        pt = _text_key(p.get("text", ""))
+        if not dt or not pt:
+            return p
+        if pt.startswith(dt[: min(32, len(dt))]) or dt.startswith(pt[: min(32, len(pt))]):
+            return p
+        if dt in pt or pt in dt:
+            return p
+    for p in api_posts:
+        if _norm_user(p.get("username", "")) == du:
+            return p
+    return None
+
+
+def _merge_posts_with_dom(
+    api_posts: list[dict[str, Any]], dom_posts: list[dict[str, Any]], url: str
+) -> list[dict[str, Any]]:
+    """Reorder/enrich API rows using on-screen card order (first card = root post)."""
+    if not dom_posts:
+        return api_posts
+    url_user, url_code = _parse_url_target(url)
+    dom0_user = _norm_user(dom_posts[0].get("username", ""))
+    if url_user and dom0_user != _norm_user(url_user):
+        for i, d in enumerate(dom_posts):
+            if _norm_user(d.get("username", "")) == _norm_user(url_user):
+                dom_posts = dom_posts[i:]
+                break
+        else:
+            return api_posts or dom_posts
+
+    merged: list[dict[str, Any]] = []
+    used_keys: set[str] = set()
+    for idx, dom in enumerate(dom_posts):
+        hit = _find_api_match(dom, api_posts) if api_posts else None
+        if hit:
+            key = str(hit.get("pk") or _text_key(hit.get("text", "")))
+            row = {**hit}
+            if len((row.get("text") or "").strip()) < len((dom.get("text") or "").strip()):
+                row["text"] = dom.get("text", row.get("text", ""))
+            if dom.get("avatar_url") and not row.get("avatar_url"):
+                row["avatar_url"] = dom["avatar_url"]
+            if dom.get("time_ago"):
+                row["time_ago"] = dom["time_ago"]
+        else:
+            key = f"{_norm_user(dom.get('username', ''))}:{_text_key(dom.get('text', ''))}"
+            row = {
+                **dom,
+                "is_reply": idx > 0,
+                "thread_order": idx,
+            }
+        if key in used_keys:
+            continue
+        used_keys.add(key)
+        row["thread_order"] = idx
+        row["is_reply"] = idx > 0
+        merged.append(row)
+
+    if url_code and api_posts:
+        for p in api_posts:
+            code = str(p.get("code") or "")
+            pk = str(p.get("pk") or "")
+            if code != url_code and url_code not in pk:
+                continue
+            key = str(p.get("pk") or _text_key(p.get("text", "")))
+            if key in used_keys:
+                continue
+            if _norm_user(p.get("username", "")) == _norm_user(url_user):
+                merged.insert(0, {**p, "thread_order": 0, "is_reply": False})
+                used_keys.add(key)
+                break
+
+    if not merged:
+        return api_posts or dom_posts
+
+    root_user = _norm_user(merged[0].get("username", "")) if merged else ""
+    if api_posts:
+        for p in api_posts:
+            key = str(p.get("pk") or f"{_norm_user(p.get('username', ''))}:{_text_key(p.get('text', ''))}")
+            if key in used_keys:
+                continue
+            if _norm_user(p.get("username", "")) == root_user and not p.get("is_reply"):
+                continue
+            merged.append(p)
+            used_keys.add(key)
+    return merged if merged else (api_posts or dom_posts)
+
+
+def _matches_url_post(p: dict[str, Any], url_code: str) -> bool:
+    if not url_code:
+        return False
+    if str(p.get("code") or "") == url_code:
+        return True
+    pk = str(p.get("pk") or "")
+    return bool(pk and url_code in pk)
+
+
+def _pick_best_thread_block(
+    blocks: list[list[dict[str, Any]]], url_user: str, url_code: str
+) -> list[dict[str, Any]] | None:
+    if not blocks:
+        return None
+    best: list[dict[str, Any]] | None = None
+    best_score = -1
+    for block in blocks:
+        if not block:
+            continue
+        score = 0
+        head = block[0]
+        if url_user and _norm_user(head.get("username", "")) == _norm_user(url_user):
+            score += 10_000
+        if url_user and any(_norm_user(p.get("username", "")) == _norm_user(url_user) for p in block):
+            score += 2_000
+        if url_code:
+            if any(str(p.get("code") or "") == url_code for p in block):
+                score += 5_000
+            if any(str(p.get("pk") or "") == url_code for p in block):
+                score += 5_000
+        score += min(len(block), 50)
+        if score > best_score:
+            best_score = score
+            best = block
+    return best
+
+
+def _split_root_and_replies(posts: list[dict[str, Any]], url: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Pick the real root post (author) instead of assuming API walk order == DOM order."""
+    if len(posts) == 1:
+        return posts[0], []
+
+    url_user, url_code = _parse_url_target(url)
+
+    if url_user and _norm_user(posts[0].get("username", "")) == _norm_user(url_user):
+        if not url_code or _matches_url_post(posts[0], url_code) or not any(
+            _matches_url_post(p, url_code) for p in posts
+        ):
+            return posts[0], posts[1:]
+
+    def _matches_url(p: dict[str, Any]) -> bool:
+        return _matches_url_post(p, url_code)
+
+    def _username_match(p: dict[str, Any]) -> bool:
+        return bool(url_user) and _norm_user(p.get("username", "")) == _norm_user(url_user)
+
+    # 1) Exact permalink match (username + code/pk)
+    for p in posts:
+        if _username_match(p) and _matches_url(p):
+            rest = [x for x in posts if x is not p]
+            return p, rest
+
+    # 2) Post id from URL only
+    if url_code:
+        for p in posts:
+            if _matches_url(p):
+                rest = [x for x in posts if x is not p]
+                return p, rest
+
+    # 3) Author on permalink without code match — prefer non-reply + most replies (thread head)
+    if url_user:
+        author_posts = [p for p in posts if _norm_user(p.get("username", "")) == _norm_user(url_user)]
+        if author_posts:
+            roots = [p for p in author_posts if not p.get("is_reply")]
+            pool = roots or author_posts
+            root = max(pool, key=lambda x: (int(x.get("replies", 0)), len(x.get("text", ""))))
+            rest = [x for x in posts if x is not root]
+            return root, rest
+
+    # 4) Any node explicitly marked not-a-reply
+    non_replies = [p for p in posts if not p.get("is_reply")]
+    if non_replies:
+        root = max(non_replies, key=lambda x: (int(x.get("replies", 0)), len(x.get("text", ""))))
+        rest = [x for x in posts if x is not root]
+        return root, rest
+
+    # 5) Heuristic: thread head usually has highest direct_reply_count among top-like posts
+    root = max(posts, key=lambda x: (int(x.get("replies", 0)), int(x.get("likes", 0)), len(x.get("text", ""))))
+    rest = [x for x in posts if x is not root]
+    return root, rest
+
+
+def _collect_post_objects(payloads: list[Any], *, page_url: str = "") -> list[dict[str, Any]]:
     seen_pks: set[str] = set()
     extracted: list[dict[str, Any]] = []
+    thread_items_hits: list[list[dict[str, Any]]] = []
+
+    def _post_dict(p: dict[str, Any], *, thread_order: int | None = None) -> dict[str, Any] | None:
+        pk = str(p.get("pk") or p.get("id") or "")
+        user = p.get("user") or {}
+        username = user.get("username") or ""
+        caption = p.get("caption") or {}
+        text = caption.get("text") if isinstance(caption, dict) else ""
+        if not text:
+            frags = (((p.get("text_post_app_info") or {}).get("text_fragments") or {}).get("fragments") or [])
+            text = "".join(f.get("plaintext", "") for f in frags if isinstance(f, dict))
+        text = _strip_threads_ui_noise((text or "").strip())
+        images = _extract_post_images(p)
+        if not username or (not text and not images):
+            return None
+        dedup_key = pk or f"{username}:{text[:50]}"
+        if dedup_key in seen_pks:
+            return None
+        seen_pks.add(dedup_key)
+
+        info = p.get("text_post_app_info") or {}
+        is_reply = bool(info.get("is_reply")) or bool(info.get("parent_post_id"))
+        if not is_reply and info.get("reply_to_author"):
+            is_reply = True
+        time_ago = ""
+        taken = p.get("taken_at")
+        if taken:
+            time_ago = _time_ago_from_taken(int(taken))
+        return {
+            "username": username,
+            "time_ago": time_ago,
+            "avatar_url": user.get("profile_pic_url") or "",
+            "text": text,
+            "image_urls": images,
+            "likes": int(p.get("like_count") or 0),
+            "replies": int(info.get("direct_reply_count") or p.get("comment_count") or 0),
+            "reposts": int((info.get("repost_count") or 0) + (info.get("quote_count") or 0)),
+            "pk": pk,
+            "code": str(p.get("code") or ""),
+            "is_reply": is_reply,
+            "thread_order": thread_order,
+        }
+
+    def _try_parse_post(p: dict[str, Any], *, thread_order: int | None = None) -> None:
+        row = _post_dict(p, thread_order=thread_order)
+        if row:
+            extracted.append(row)
 
     def _walk(node: Any) -> None:
         if isinstance(node, dict):
+            thread_items = node.get("thread_items")
+            if isinstance(thread_items, list) and thread_items:
+                ordered: list[dict[str, Any]] = []
+                for i, item in enumerate(thread_items):
+                    if not isinstance(item, dict):
+                        continue
+                    post = item.get("post")
+                    if isinstance(post, dict):
+                        row = _post_dict(post, thread_order=i)
+                        if row:
+                            ordered.append(row)
+                if ordered:
+                    thread_items_hits.append(ordered)
             if "post" in node and isinstance(node["post"], dict):
                 _try_parse_post(node["post"])
             elif "user" in node and ("caption" in node or "text_post_app_info" in node):
@@ -231,40 +553,15 @@ def _collect_post_objects(payloads: list[Any]) -> list[dict[str, Any]]:
             for elem in node:
                 _walk(elem)
 
-    def _try_parse_post(p: dict[str, Any]) -> None:
-        pk = str(p.get("pk") or p.get("id") or "")
-        user = p.get("user") or {}
-        username = user.get("username") or ""
-        caption = p.get("caption") or {}
-        text = caption.get("text") if isinstance(caption, dict) else ""
-        if not text:
-            # Try text_fragments
-            frags = (((p.get("text_post_app_info") or {}).get("text_fragments") or {}).get("fragments") or [])
-            text = "".join(f.get("plaintext", "") for f in frags if isinstance(f, dict))
-        text = (text or "").strip()
-        images = _extract_post_images(p)
-        if not username or (not text and not images):
-            return
-        dedup_key = pk or f"{username}:{text[:50]}"
-        if dedup_key in seen_pks:
-            return
-        seen_pks.add(dedup_key)
-
-        info = p.get("text_post_app_info") or {}
-        extracted.append(
-            {
-                "username": username,
-                "avatar_url": user.get("profile_pic_url") or "",
-                "text": text,
-                "image_urls": images,
-                "likes": int(p.get("like_count") or 0),
-                "replies": int(info.get("direct_reply_count") or 0),
-                "reposts": int((info.get("repost_count") or 0) + (info.get("quote_count") or 0)),
-            }
-        )
-
     for payload in payloads:
         _walk(payload)
+
+    url_user, url_code = _parse_url_target(page_url)
+    if thread_items_hits:
+        best = _pick_best_thread_block(thread_items_hits, url_user, url_code)
+        if best:
+            return best
+
     return extracted
 
 
@@ -288,19 +585,51 @@ def _extract_dom_fallback(page) -> list[dict[str, Any]]:
         return page.evaluate(
             """() => {
                 const results = [];
-                const articles = document.querySelectorAll('[data-pressable-container="true"]');
+                const pathMatch = window.location.pathname.match(/\\/@([^/]+)\\/post\\/([^/?#]+)/i);
+                const expectUser = pathMatch ? pathMatch[1].toLowerCase() : '';
+                const root = document.querySelector('main') || document.body;
+                const articles = root.querySelectorAll('[data-pressable-container="true"]');
                 articles.forEach((el) => {
                     const userLink = el.querySelector('a[href^="/@"]');
                     if (!userLink) return;
                     const username = userLink.getAttribute('href').replace('/@', '').split('/')[0];
+                    const userLower = username.toLowerCase();
+                    if (expectUser && userLower !== expectUser && results.length === 0) {
+                        return;
+                    }
                     const avatarImg = el.querySelector('img[alt*="profile"], img');
+                    const isUiNoise = (t) => /^(translate|see translation|view translation|dịch|xem bản dịch|bản dịch|author|tác giả|người đăng|original poster)$/i.test(t);
+                    const isTimeLabel = (t) => /^(\\d+[smhdw]|\\d+\\s*(giờ|phút|ngày|giây|tuần|tháng|năm)|vừa xong|hôm qua)$/i.test(t) || /^\\d{1,3}h$/i.test(t);
+                    let timeAgo = '';
+                    const timeNode = el.querySelector('time');
+                    if (timeNode) {
+                        const t = (timeNode.innerText || '').trim();
+                        if (t) timeAgo = t;
+                    }
                     const spans = Array.from(el.querySelectorAll('span[dir="auto"]'))
+                        .filter((s) => {
+                            const t = (s.innerText || '').trim();
+                            if (isUiNoise(t)) return false;
+                            const btn = s.closest('[role="button"], button, a');
+                            if (btn && isUiNoise(t)) return false;
+                            return true;
+                        })
                         .map(s => s.innerText.trim())
-                        .filter(t => t && t !== username && !/^[0-9.,KMB]+$/.test(t) && t.length > 2);
-                    const text = spans.join('\\n').trim();
+                        .filter(t => t && t !== username && !/^[0-9.,KMB]+$/.test(t) && t.length > 2 && !isUiNoise(t));
+                    const body = [];
+                    for (const t of spans) {
+                        if (!timeAgo && isTimeLabel(t)) {
+                            timeAgo = t;
+                            continue;
+                        }
+                        if (isTimeLabel(t)) continue;
+                        body.push(t);
+                    }
+                    const text = body.join('\\n').trim();
                     if (username && text) {
                         results.push({
                             username,
+                            time_ago: timeAgo,
                             avatar_url: avatarImg ? avatarImg.src : '',
                             text,
                             image_urls: [],

@@ -13,6 +13,7 @@ from fluent_blue.compatibility.qt import (
     QBrush,
     QColor,
     QFont,
+    QFontMetrics,
     QImage,
     QLinearGradient,
     QPainter,
@@ -107,7 +108,15 @@ def render_threads_card_qimage(seg: SegmentItem, layout: LayoutConfig, *, base_w
     # 1. Avatar circle
     av_x = float(pad_x)
     av_y = float(pad_top)
-    _draw_avatar(painter, seg, av_x, av_y, float(avatar_size))
+    _draw_avatar(
+        painter,
+        seg,
+        av_x,
+        av_y,
+        float(avatar_size),
+        hide_photo=layout.hide_username,
+        is_dark_card=is_dark,
+    )
 
     # 2. Username (or privacy pill if `Che tên` enabled)
     uname_x = av_x + avatar_size + 18
@@ -123,13 +132,27 @@ def render_threads_card_qimage(seg: SegmentItem, layout: LayoutConfig, *, base_w
         u_font.setWeight(QFont.Weight.DemiBold)
         painter.setFont(u_font)
         painter.setPen(fg_col)
+        uname_fm = QFontMetrics(u_font)
         painter.drawText(
             QRectF(uname_x, av_y, base_width - uname_x - 240, avatar_size),
             int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
             seg.username,
         )
+        time_lbl = (seg.time_ago or "").strip()
+        if time_lbl:
+            t_font = QFont("Segoe UI", 1)
+            t_font.setPixelSize(26)
+            t_font.setWeight(QFont.Weight.Normal)
+            painter.setFont(t_font)
+            painter.setPen(muted_col)
+            time_x = uname_x + uname_fm.horizontalAdvance(seg.username) + 14
+            painter.drawText(
+                QRectF(time_x, av_y, base_width - time_x - 200, avatar_size),
+                int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                time_lbl,
+            )
 
-    # 3. Top-right `@ threads` emblem + wordmark (matching Video 1)
+    # 3. Top-right Threads `@` glyph only (no wordmark)
     _draw_threads_brand(painter, float(base_width - pad_x), av_y + avatar_size * 0.5, fg_col)
 
     # 4. Body text
@@ -192,14 +215,48 @@ def _build_body_doc(text: str, width: int, fg_col: QColor) -> QTextDocument:
     return doc
 
 
-def _draw_avatar(painter: QPainter, seg: SegmentItem, x: float, y: float, size: float) -> None:
+def _draw_anonymous_avatar(
+    painter: QPainter, x: float, y: float, size: float, *, is_dark_card: bool = False
+) -> None:
+    """Neutral Threads-style placeholder (no photo, no initials)."""
+    bg = QColor("#F0F0F0") if not is_dark_card else QColor("#3F3F46")
+    fg = QColor("#C8C8C8") if not is_dark_card else QColor("#71717A")
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(bg)
+    painter.drawEllipse(QRectF(x, y, size, size))
+
+    head_r = size * 0.19
+    cx = x + size * 0.5
+    head_cy = y + size * 0.39
+    painter.setBrush(fg)
+    painter.drawEllipse(QPointF(cx, head_cy), head_r, head_r)
+
+    body = QPainterPath()
+    body_w = size * 0.56
+    body_h = size * 0.36
+    body.addEllipse(QRectF(cx - body_w * 0.5, head_cy + head_r * 0.45, body_w, body_h))
+    painter.fillPath(body, fg)
+
+
+def _draw_avatar(
+    painter: QPainter,
+    seg: SegmentItem,
+    x: float,
+    y: float,
+    size: float,
+    *,
+    hide_photo: bool = False,
+    is_dark_card: bool = False,
+) -> None:
     circle = QPainterPath()
     circle.addEllipse(QRectF(x, y, size, size))
     loaded = QImage(seg.avatar_local) if seg.avatar_local and Path(seg.avatar_local).exists() else QImage()
 
     painter.save()
     painter.setClipPath(circle)
-    if not loaded.isNull():
+    if hide_photo:
+        _draw_anonymous_avatar(painter, x, y, size, is_dark_card=is_dark_card)
+    elif not loaded.isNull():
         scaled = loaded.scaled(
             int(size),
             int(size),
@@ -228,26 +285,8 @@ def _draw_avatar(painter: QPainter, seg: SegmentItem, x: float, y: float, size: 
 
 
 def _draw_threads_brand(painter: QPainter, right_x: float, center_y: float, color: QColor) -> None:
-    """Draw the crisp `@ threads` wordmark + spiral glyph in the top-right corner."""
-    w_font = QFont("Segoe UI")
-    w_font.setPixelSize(33)
-    w_font.setWeight(QFont.Weight.Bold)
-    w_font.setItalic(True)
-    painter.setFont(w_font)
-    painter.setPen(color)
-
-    word = "threads"
-    fm = painter.fontMetrics()
-    word_w = fm.horizontalAdvance(word)
-    word_x = right_x - word_w
-    painter.drawText(
-        QRectF(word_x, center_y - 24, word_w + 6, 48),
-        int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-        word,
-    )
-
-    # Spiral `@` icon to the left of `threads`
-    gx = word_x - 36
+    """Draw the Threads spiral `@` glyph in the top-right corner."""
+    gx = right_x - 10
     gy = center_y
     pen = QPen(color, 2.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen)
