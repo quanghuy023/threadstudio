@@ -301,6 +301,22 @@ class ThreadsStudioWindow(FluentWindow):
         flags_cta_row.add(self._chk_require_review)
         flags_cta_row.add_stretch(1)
 
+        self._chk_watermark = Checkbox(
+            "Chèn watermark chạy quanh video",
+            checked=self.settings.layout.watermark_enabled,
+        )
+        self._watermark_input = Input(
+            placeholder="VD: @kenh_cua_ban · Threads Studio",
+            clearable=True,
+            text=self.settings.layout.watermark_text,
+        )
+        self._watermark_field = FormField("Nội dung watermark", self._watermark_input)
+        self._watermark_field.setVisible(self.settings.layout.watermark_enabled)
+
+        wm_row = Stack(direction="vertical", spacing=2)
+        wm_row.add(self._chk_watermark)
+        wm_row.add(self._watermark_field)
+
         self._btn_enqueue = Button(
             "Tạo Video Đa Luồng",
             variant="primary",
@@ -309,6 +325,7 @@ class ThreadsStudioWindow(FluentWindow):
         )
         flags_cta_row.add(self._btn_enqueue)
         ingest_panel.add(flags_cta_row)
+        ingest_panel.add(wm_row)
         col.addWidget(ingest_panel)
 
         # Section B: Batch Queue DataTable
@@ -879,6 +896,8 @@ class ThreadsStudioWindow(FluentWindow):
             lambda layer: self._geom_tabs.setCurrentIndex(0 if layer == "card" else 1)
         )
         self._chk_hide_name.toggled.connect(self._on_layout_controls_changed)
+        self._chk_watermark.toggled.connect(self._on_watermark_toggle)
+        self._watermark_input.textChanged.connect(self._on_layout_controls_changed)
         self._chk_sub_video.toggled.connect(self._on_layout_controls_changed)
         for sp in (
             self._spin_card_x,
@@ -926,6 +945,14 @@ class ThreadsStudioWindow(FluentWindow):
     # Actions & Event Handlers
     # ------------------------------------------------------------------
 
+    def closeEvent(self, event) -> None:  # noqa: N802
+        try:
+            self._collect_live_settings()
+            self.settings.save()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     def _on_nav_changed(self, key: str) -> None:
         if key in self._page_keys:
             self._pages.setCurrentIndex(self._page_keys.index(key))
@@ -936,6 +963,7 @@ class ThreadsStudioWindow(FluentWindow):
         self.settings.theme = target
 
     def _collect_live_settings(self) -> None:
+        self._flush_layout_settings(refresh_preview=False)
         self.settings.comment_mode = str(self._cmt_mode_select.value() or CommentMode.TOP_LIKES_WITH_AUTHOR.value)
         self.settings.max_comments = int(self._cmt_count_spin.value())
         self.settings.voice_speed = float(self._speed_quick_spin.value())
@@ -991,8 +1019,15 @@ class ThreadsStudioWindow(FluentWindow):
         merged = f"{cur}\n{cb}".strip() if cur else cb
         self._batch_input_area.set_text(merged)
 
+    def _on_watermark_toggle(self, enabled: bool) -> None:
+        self._watermark_field.setVisible(bool(enabled))
+        self._flush_layout_settings()
+
     def _on_enqueue_clicked(self) -> None:
         self._collect_live_settings()
+        if self._chk_watermark.isChecked() and not self._watermark_input.text().strip():
+            Toast.show("Hãy nhập nội dung watermark hoặc tắt tùy chọn watermark.", parent=self, variant="warning")
+            return
         raw = self._batch_input_area.text().strip()
         if not raw:
             Toast.show("Hãy dán ít nhất 1 link Threads hoặc bấm 'Nạp Bài Mẫu Video 1'.", parent=self, variant="warning")
@@ -1331,6 +1366,9 @@ class ThreadsStudioWindow(FluentWindow):
             self._spin_card_rad.set_value(cfg.card_radius_px)
             self._sel_card_theme.set_value(cfg.card_theme)
             self._chk_hide_name.setChecked(cfg.hide_username)
+            self._chk_watermark.setChecked(cfg.watermark_enabled)
+            self._watermark_input.setText(cfg.watermark_text)
+            self._watermark_field.setVisible(cfg.watermark_enabled)
 
             self._chk_sub_video.setChecked(cfg.sub_enabled)
             self._spin_sub_x.set_value(cfg.sub_x_pct)
@@ -1342,7 +1380,7 @@ class ThreadsStudioWindow(FluentWindow):
         finally:
             self._syncing_layout_controls = False
 
-    def _on_layout_controls_changed(self, *_args) -> None:
+    def _flush_layout_settings(self, *, refresh_preview: bool = True) -> None:
         if self._syncing_layout_controls:
             return
         cfg = self.settings.layout
@@ -1352,6 +1390,8 @@ class ThreadsStudioWindow(FluentWindow):
         cfg.card_radius_px = int(self._spin_card_rad.value())
         cfg.card_theme = str(self._sel_card_theme.value() or "light")
         cfg.hide_username = self._chk_hide_name.isChecked()
+        cfg.watermark_enabled = self._chk_watermark.isChecked()
+        cfg.watermark_text = self._watermark_input.text().strip()
 
         cfg.sub_enabled = self._chk_sub_video.isChecked()
         cfg.sub_x_pct = float(self._spin_sub_x.value())
@@ -1361,7 +1401,11 @@ class ThreadsStudioWindow(FluentWindow):
         cfg.sub_radius_px = int(self._spin_sub_rad.value())
         cfg.sub_fit = str(self._sel_sub_fit.value() or "cover")
 
-        self._canvas.refresh_card()
+        if refresh_preview:
+            self._canvas.refresh_card()
+
+    def _on_layout_controls_changed(self, *_args) -> None:
+        self._flush_layout_settings(refresh_preview=True)
 
     def _reset_layout_defaults(self) -> None:
         self.settings.layout = LayoutConfig()

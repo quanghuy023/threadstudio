@@ -60,6 +60,10 @@ class AppSettings:
         p.mkdir(parents=True, exist_ok=True)
         return p
 
+    @classmethod
+    def config_path(cls) -> Path:
+        return project_root() / "user_data" / "settings.json"
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "theme": self.theme,
@@ -89,7 +93,7 @@ class AppSettings:
 
     @classmethod
     def load(cls, path: Path | None = None) -> AppSettings:
-        cfg_path = path or (project_root() / "user_data" / "settings.json")
+        cfg_path = path or cls.config_path()
         sample_root = project_root() / "assets" / "sample_media"
         default_media = MediaConfig(
             bg_video_dir=str(sample_root / "bg_grid"),
@@ -158,7 +162,7 @@ class AppSettings:
         )
 
     def save(self, path: Path | None = None) -> None:
-        cfg_path = path or (project_root() / "user_data" / "settings.json")
+        cfg_path = path or self.config_path()
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
 

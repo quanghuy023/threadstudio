@@ -57,6 +57,8 @@ class LayoutConfig:
     card_radius_px: int = 0
     card_theme: str = "light"  # "light" | "dark"
     hide_username: bool = False
+    watermark_enabled: bool = False
+    watermark_text: str = ""
 
     # Secondary B-Roll / Meme Video
     sub_enabled: bool = True

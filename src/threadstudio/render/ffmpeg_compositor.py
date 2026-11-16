@@ -19,6 +19,49 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac"}
 
 
+def _ffmpeg_fontfile() -> str:
+    for candidate in (
+        Path(r"C:\Windows\Fonts\segoeui.ttf"),
+        Path(r"C:\Windows\Fonts\arial.ttf"),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    ):
+        if candidate.exists():
+            return str(candidate).replace("\\", "/").replace(":", "\\:")
+    return ""
+
+
+def _append_orbiting_watermark(
+    chains: list[str],
+    curr_v: str,
+    *,
+    text: str,
+    total_dur: float,
+    work_dir: Path,
+) -> str:
+    """FFmpeg drawtext on an elliptical path around the 9:16 frame."""
+    text = text.strip()
+    if not text:
+        return curr_v
+    font = _ffmpeg_fontfile()
+    if not font:
+        return curr_v
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    textfile = work_dir / "watermark.txt"
+    textfile.write_text(text, encoding="utf-8")
+    tf = str(textfile.resolve()).replace("\\", "/").replace(":", "\\:")
+
+    period = max(12.0, min(28.0, max(total_dur, 8.0)))
+    out = "vwm"
+    chains.append(
+        f"[{curr_v}]drawtext=fontfile='{font}':textfile='{tf}':reload=0:"
+        f"fontsize=40:fontcolor=white@0.40:borderw=2:bordercolor=black@0.30:"
+        f"x='(w-text_w)/2+(w/2-max(72\\,text_w))*cos(2*PI*t/{period:.2f})':"
+        f"y='(h-text_h)/2+(h/2-max(150\\,text_h))*sin(2*PI*t/{period:.2f})'[{out}]"
+    )
+    return out
+
+
 @lru_cache(maxsize=1)
 def nvenc_available() -> bool:
     """Test whether h264_nvenc actually initializes on an NVIDIA GPU."""
@@ -357,6 +400,15 @@ def _run_ffmpeg_compositor(
             f"eof_action=pass:enable='{enable_expr}'[{out_lbl}]"
         )
         curr_v = out_lbl
+
+    if layout.watermark_enabled and layout.watermark_text.strip():
+        curr_v = _append_orbiting_watermark(
+            chains,
+            curr_v,
+            text=layout.watermark_text,
+            total_dur=total_dur,
+            work_dir=final_mp4.parent,
+        )
 
     chains.append(f"[{curr_v}]format=yuv420p[vfinal]")
 
