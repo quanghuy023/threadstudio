@@ -15,7 +15,7 @@ from ..core.models import LayoutConfig, MediaConfig, SegmentItem, VideoJob
 
 CANVAS_W = 1080
 CANVAS_H = 1920
-VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".gif"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".aac"}
 
 
