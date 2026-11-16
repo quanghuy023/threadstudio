@@ -31,6 +31,16 @@ _RELATIVE_TIME_LABEL = re.compile(
     r"^(\d+[smhdw]|(\d+)\s*(giờ|phút|ngày|giây|tuần|tháng|năm)|vừa xong|hôm qua)$",
     re.IGNORECASE,
 )
+# Post date stamp / thread pager leaked from Threads header (e.g. 10/15/26, 2/7)
+_THREADS_META_LINE = re.compile(
+    r"^(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{1,2}\s+\d{1,2}\s+\d{2,4}|\d+/\d+|"
+    r"translate\s+\d+/\d+)$",
+    re.IGNORECASE,
+)
+_THREADS_DATE_PREFIX = re.compile(
+    r"^(\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{1,2}\s+\d{1,2}\s+\d{2,4})\s+",
+    re.IGNORECASE,
+)
 
 
 def _is_relative_time_label(text: str) -> bool:
@@ -40,6 +50,13 @@ def _is_relative_time_label(text: str) -> bool:
     if _RELATIVE_TIME_LABEL.match(t):
         return True
     return bool(re.match(r"^\d{1,3}[hH]$", t))
+
+
+def _is_threads_meta_label(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(_THREADS_META_LINE.match(t))
 
 
 def _time_ago_from_taken(taken_at: int) -> str:
@@ -67,7 +84,8 @@ def _strip_threads_ui_noise(text: str) -> str:
     lines: list[str] = []
     for line in text.replace("\r\n", "\n").split("\n"):
         s = _THREADS_UI_TAIL.sub("", line.strip()).strip()
-        if not s or _THREADS_UI_LINE.match(s) or _is_relative_time_label(s):
+        s = _THREADS_DATE_PREFIX.sub("", s).strip()
+        if not s or _THREADS_UI_LINE.match(s) or _is_relative_time_label(s) or _is_threads_meta_label(s):
             continue
         lines.append(s)
     return "\n".join(lines).strip()
@@ -600,6 +618,7 @@ def _extract_dom_fallback(page) -> list[dict[str, Any]]:
                     const avatarImg = el.querySelector('img[alt*="profile"], img');
                     const isUiNoise = (t) => /^(translate|see translation|view translation|dịch|xem bản dịch|bản dịch|author|tác giả|người đăng|original poster)$/i.test(t);
                     const isTimeLabel = (t) => /^(\\d+[smhdw]|\\d+\\s*(giờ|phút|ngày|giây|tuần|tháng|năm)|vừa xong|hôm qua)$/i.test(t) || /^\\d{1,3}h$/i.test(t);
+                    const isMetaLabel = (t) => /^\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4}$/.test(t) || /^\\d{1,2}\\s+\\d{1,2}\\s+\\d{2,4}$/.test(t) || /^\\d+\\/\\d+$/.test(t) || /^translate\\s+\\d+\\/\\d+$/i.test(t);
                     let timeAgo = '';
                     const timeNode = el.querySelector('time');
                     if (timeNode) {
@@ -622,10 +641,11 @@ def _extract_dom_fallback(page) -> list[dict[str, Any]]:
                             timeAgo = t;
                             continue;
                         }
-                        if (isTimeLabel(t)) continue;
+                        if (isTimeLabel(t) || isMetaLabel(t)) continue;
                         body.push(t);
                     }
-                    const text = body.join('\\n').trim();
+                    let text = body.join('\\n').trim();
+                    text = text.replace(/^\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4}\\s+/m, '').trim();
                     if (username && text) {
                         results.push({
                             username,
