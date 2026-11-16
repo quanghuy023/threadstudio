@@ -51,7 +51,8 @@ def _append_orbiting_watermark(
     textfile.write_text(text, encoding="utf-8")
     tf = str(textfile.resolve()).replace("\\", "/").replace(":", "\\:")
 
-    period = max(12.0, min(28.0, max(total_dur, 8.0)))
+    # Seconds per full orbit (larger = slower movement around the frame)
+    period = max(28.0, min(72.0, max(total_dur * 1.35, 22.0)))
     out = "vwm"
     chains.append(
         f"[{curr_v}]drawtext=fontfile='{font}':textfile='{tf}':reload=0:"
