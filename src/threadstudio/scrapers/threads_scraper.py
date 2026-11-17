@@ -59,6 +59,48 @@ def _is_threads_meta_label(text: str) -> bool:
     return bool(_THREADS_META_LINE.match(t))
 
 
+def _parse_metric_count(raw: str) -> int:
+    """Parse Threads-style counts: 96, 1.2K, 3M…"""
+    t = (raw or "").strip().replace(",", "")
+    if not t:
+        return 0
+    m = re.match(r"^(\d+(?:\.\d+)?)([KMB])?$", t, re.IGNORECASE)
+    if not m:
+        digits = re.sub(r"[^\d]", "", t)
+        return int(digits) if digits else 0
+    val = float(m.group(1))
+    suffix = (m.group(2) or "").upper()
+    if suffix == "K":
+        val *= 1_000
+    elif suffix == "M":
+        val *= 1_000_000
+    elif suffix == "B":
+        val *= 1_000_000_000
+    return int(round(val))
+
+
+def _engagement_from_post(p: dict[str, Any]) -> tuple[int, int, int]:
+    info = p.get("text_post_app_info") or {}
+    likes_raw = p.get("like_count")
+    if likes_raw is None:
+        lav = p.get("like_and_view_counts")
+        if isinstance(lav, dict):
+            likes_raw = lav.get("like_count") or lav.get("likes")
+    if likes_raw is None:
+        info_lav = info.get("like_and_view_counts")
+        if isinstance(info_lav, dict):
+            likes_raw = info_lav.get("like_count") or info_lav.get("likes")
+    likes = int(likes_raw or 0)
+    replies = int(info.get("direct_reply_count") or p.get("comment_count") or 0)
+    reposts = int((info.get("repost_count") or 0) + (info.get("quote_count") or 0))
+    return likes, replies, reposts
+
+
+def _merge_engagement(row: dict[str, Any], other: dict[str, Any]) -> None:
+    for key in ("likes", "replies", "reposts"):
+        row[key] = max(int(row.get(key) or 0), int(other.get(key) or 0))
+
+
 def _time_ago_from_taken(taken_at: int) -> str:
     """Format like Threads short relative labels (23h, 45m, 3d)."""
     try:
@@ -311,6 +353,16 @@ def _text_key(text: str, n: int = 56) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())[:n]
 
 
+def _enrich_posts_engagement_from_dom(posts: list[dict[str, Any]], dom_posts: list[dict[str, Any]]) -> None:
+    """Align API rows with on-screen like/reply counts (comments often lack like_count in JSON)."""
+    if not dom_posts:
+        return
+    for row in posts:
+        dom = _find_api_match(row, dom_posts)
+        if dom:
+            _merge_engagement(row, dom)
+
+
 def _find_api_match(dom_row: dict[str, Any], api_posts: list[dict[str, Any]]) -> dict[str, Any] | None:
     du = _norm_user(dom_row.get("username", ""))
     dt = _text_key(dom_row.get("text", ""))
@@ -359,6 +411,7 @@ def _merge_posts_with_dom(
                 row["avatar_url"] = dom["avatar_url"]
             if dom.get("time_ago"):
                 row["time_ago"] = dom["time_ago"]
+            _merge_engagement(row, dom)
         else:
             key = f"{_norm_user(dom.get('username', ''))}:{_text_key(dom.get('text', ''))}"
             row = {
@@ -400,6 +453,7 @@ def _merge_posts_with_dom(
                 continue
             merged.append(p)
             used_keys.add(key)
+    _enrich_posts_engagement_from_dom(merged, dom_posts)
     return merged if merged else (api_posts or dom_posts)
 
 
@@ -526,15 +580,16 @@ def _collect_post_objects(payloads: list[Any], *, page_url: str = "") -> list[di
         taken = p.get("taken_at")
         if taken:
             time_ago = _time_ago_from_taken(int(taken))
+        likes, replies, reposts = _engagement_from_post(p)
         return {
             "username": username,
             "time_ago": time_ago,
             "avatar_url": user.get("profile_pic_url") or "",
             "text": text,
             "image_urls": images,
-            "likes": int(p.get("like_count") or 0),
-            "replies": int(info.get("direct_reply_count") or p.get("comment_count") or 0),
-            "reposts": int((info.get("repost_count") or 0) + (info.get("quote_count") or 0)),
+            "likes": likes,
+            "replies": replies,
+            "reposts": reposts,
             "pk": pk,
             "code": str(p.get("code") or ""),
             "is_reply": is_reply,
@@ -619,6 +674,86 @@ def _extract_dom_fallback(page) -> list[dict[str, Any]]:
                     const isUiNoise = (t) => /^(translate|see translation|view translation|dịch|xem bản dịch|bản dịch|author|tác giả|người đăng|original poster)$/i.test(t);
                     const isTimeLabel = (t) => /^(\\d+[smhdw]|\\d+\\s*(giờ|phút|ngày|giây|tuần|tháng|năm)|vừa xong|hôm qua)$/i.test(t) || /^\\d{1,3}h$/i.test(t);
                     const isMetaLabel = (t) => /^\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4}$/.test(t) || /^\\d{1,2}\\s+\\d{1,2}\\s+\\d{2,4}$/.test(t) || /^\\d+\\/\\d+$/.test(t) || /^translate\\s+\\d+\\/\\d+$/i.test(t);
+                    const parseCount = (raw) => {
+                        const t = (raw || '').trim().replace(/,/g, '');
+                        const m = t.match(/^(\\d+(?:\\.\\d+)?)([KMB])?$/i);
+                        if (!m) return 0;
+                        let n = parseFloat(m[1]);
+                        const u = (m[2] || '').toUpperCase();
+                        if (u === 'K') n *= 1000;
+                        else if (u === 'M') n *= 1000000;
+                        else if (u === 'B') n *= 1000000000;
+                        return Math.round(n);
+                    };
+                    const countFromAria = (label) => {
+                        if (!label) return 0;
+                        let best = 0;
+                        const re = /(\\d[\\d.,]*)(?:\\s*([KMB]))?/gi;
+                        let m;
+                        while ((m = re.exec(label)) !== null) {
+                            const n = parseCount(m[1] + (m[2] || ''));
+                            if (n > best) best = n;
+                        }
+                        return best;
+                    };
+                    const scrapeEngagement = (node) => {
+                        let likes = 0, replies = 0, reposts = 0;
+                        const interactive = node.querySelectorAll(
+                            '[role="button"], button, a[role="link"][href*="/post/"]'
+                        );
+                        for (const btn of interactive) {
+                            const label = (btn.getAttribute('aria-label') || '').trim();
+                            if (!label) continue;
+                            const n = countFromAria(label);
+                            if (n <= 0) continue;
+                            const low = label.toLowerCase();
+                            if (/(like|liked|thích|heart|tim|đã thích)/i.test(low)) {
+                                likes = Math.max(likes, n);
+                            } else if (/(reply|repl|comment|trả lời|bình luận|phản hồi)/i.test(low)) {
+                                replies = Math.max(replies, n);
+                            } else if (/(repost|đăng lại|chia sẻ lại|quote|trích dẫn)/i.test(low)) {
+                                reposts = Math.max(reposts, n);
+                            }
+                        }
+                        if (!likes) {
+                            const actionNums = [];
+                            for (const btn of node.querySelectorAll('[role="button"], button')) {
+                                const parts = (btn.innerText || '').trim().split(/\\s+/);
+                                for (const part of parts) {
+                                    if (!/^[\\d.,]+[KMB]?$/i.test(part)) continue;
+                                    const n = parseCount(part);
+                                    if (n > 0) actionNums.push(n);
+                                }
+                            }
+                            if (actionNums.length) {
+                                likes = actionNums[0];
+                                replies = Math.max(replies, actionNums[1] || 0);
+                                reposts = Math.max(reposts, actionNums[2] || 0);
+                            }
+                        }
+                        if (!likes) {
+                            const metrics = [];
+                            const seen = new Set();
+                            const cardRect = node.getBoundingClientRect();
+                            for (const s of node.querySelectorAll('span')) {
+                                const t = (s.innerText || '').trim();
+                                if (!/^[\\d.,]+[KMB]?$/i.test(t) || t.length > 10) continue;
+                                if (seen.has(t)) continue;
+                                const n = parseCount(t);
+                                if (n <= 0) continue;
+                                const rect = s.getBoundingClientRect();
+                                if (cardRect.height > 40 && rect.top < cardRect.top + cardRect.height * 0.28) {
+                                    continue;
+                                }
+                                seen.add(t);
+                                metrics.push(n);
+                            }
+                            likes = metrics[0] || 0;
+                            replies = metrics[1] || replies;
+                            reposts = metrics[2] || reposts;
+                        }
+                        return { likes, replies, reposts };
+                    };
                     let timeAgo = '';
                     const timeNode = el.querySelector('time');
                     if (timeNode) {
@@ -646,6 +781,7 @@ def _extract_dom_fallback(page) -> list[dict[str, Any]]:
                     }
                     let text = body.join('\\n').trim();
                     text = text.replace(/^\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4}\\s+/m, '').trim();
+                    const engagement = scrapeEngagement(el);
                     if (username && text) {
                         results.push({
                             username,
@@ -653,9 +789,9 @@ def _extract_dom_fallback(page) -> list[dict[str, Any]]:
                             avatar_url: avatarImg ? avatarImg.src : '',
                             text,
                             image_urls: [],
-                            likes: 0,
-                            replies: 0,
-                            reposts: 0
+                            likes: engagement.likes,
+                            replies: engagement.replies,
+                            reposts: engagement.reposts,
                         });
                     }
                 });
